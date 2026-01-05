@@ -1,5 +1,5 @@
-# Ignore Rust compiled artifacts
-/target/
+# ignore all target dirs anywhere
+target/
 
-# Ignore Python venv
+# ignore venv
 /venv/
