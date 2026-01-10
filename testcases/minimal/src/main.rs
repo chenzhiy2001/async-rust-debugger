@@ -23,7 +23,8 @@ async fn async_fn_leaf(x: i32) -> i32 {
 }
 
 async fn another_branch(x: i32) -> i32 {
-    sync_a(x) * 3
+    let y = Manual(x, false).await;  // Pending 3 times
+    sync_a(y) * 3
 }
 
 // Async function (non-leaf)

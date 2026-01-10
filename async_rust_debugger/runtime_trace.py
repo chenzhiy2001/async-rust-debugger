@@ -272,8 +272,6 @@ class CallSiteBP(gdb.Breakpoint):
                 gdb.write(f"[ARD] call-site {self.addr:#x} -> {target:#x}  ({sym_name})\n")
             except Exception as e:
                 gdb.write(f"[ARD] failed to set callee BP: {e}\n")
-            gdb.write(f"[ARD] call-site {self.addr:#x} -> {target:#x}  ({sym_name})\n")
-
         return False
 
 
