@@ -29,6 +29,8 @@ _WHITELIST_ADDR_MAP = {}
 _WHITELIST_ADDR_READY = False
 
 _EVENTS_INSTALLED = False
+_SEEN_AWA_EDGES = set()  # (src_fn, awa_ty) printed edges
+_EDGES = []  # (kind, src, dst)
 
 # -------------------------
 # Utilities
@@ -313,6 +315,79 @@ def _whitelist_allows_by_addr(target_addr: int) -> str | None:
 # Filtering / callee naming
 # -------------------------
 
+import shlex
+
+def _normalize_awa_dst(dst: str) -> str:
+    """
+    awa edge 的 dst 目前是“类型名”（比如 xxx::{async_fn_env#0} 或 Manual）。
+    我们把 async_fn_env/async_block_env 归一化为对应 poll symbol（async_fn/async_block）。
+    """
+    child = _child_poll_symbol_from_awaitee_type(dst)
+    return child or dst
+
+
+def _build_adj_from_edges():
+    """
+    Build adjacency list:
+      src -> list[(kind, dst)]
+    - call: dst 是 callee poll symbol
+    - awa : dst 是 awaitee type，但会 normalize 到 poll symbol（如果是 *_env）
+    """
+    adj: dict[str, list[tuple[str, str]]] = {}
+
+    for kind, src, dst in _EDGES:
+        if kind == "awa":
+            dst = _normalize_awa_dst(dst)
+
+        adj.setdefault(src, []).append((kind, dst))
+
+    # de-dup while preserving order per src
+    for src, lst in adj.items():
+        seen = set()
+        out = []
+        for kind, dst in lst:
+            key = (kind, dst)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((kind, dst))
+        adj[src] = out
+
+    return adj
+
+
+def _render_tree(root: str, *, max_depth: int = 50) -> str:
+    """
+    Render a simple ASCII tree from collected edges.
+    - Avoid infinite loops by tracking current path.
+    - Show edge kind labels: call / awa
+    """
+    adj = _build_adj_from_edges()
+    lines: list[str] = []
+
+    def dfs(node: str, prefix: str, path: list[str], depth: int):
+        if depth > max_depth:
+            lines.append(f"{prefix}... (depth>{max_depth})")
+            return
+
+        children = adj.get(node, [])
+        for i, (kind, dst) in enumerate(children):
+            last = (i == len(children) - 1)
+            branch = "└─" if last else "├─"
+            next_prefix = prefix + ("  " if last else "│ ")
+
+            # cycle detection on the current recursion path
+            if dst in path:
+                lines.append(f"{prefix}{branch} {kind} -> {dst}  (cycle)")
+                continue
+
+            lines.append(f"{prefix}{branch} {kind} -> {dst}")
+            dfs(dst, next_prefix, path + [dst], depth + 1)
+
+    lines.append(root)
+    dfs(root, "", [root], 0)
+    return "\n".join(lines) + "\n"
+
 def _is_pollish_name(sym_name: str) -> bool:
     return ("::poll" in sym_name) or ("{async_fn#" in sym_name) or ("{async_block#" in sym_name)
 
@@ -364,7 +439,8 @@ def _pick_interesting_callee(target_addr: int) -> str | None:
 # Run-scoped cleanup (ASLR/PIE safe)
 # -------------------------
 
-def _cleanup_run_scoped(reason: str):
+def _cleanup_run_scoped(reason: str, *, keep_edges: bool):
+    # 1) delete addr-based breakpoints (invalid across runs)
     for bp in list(_RUN_SCOPED_BPS):
         try:
             bp.delete()
@@ -372,17 +448,28 @@ def _cleanup_run_scoped(reason: str):
             pass
     _RUN_SCOPED_BPS.clear()
 
+    # 2) clear per-run caches
     _CALLSITE_INSTALLED_FOR_FN.clear()
     _SEEN_CALL_EDGES.clear()
+    _SEEN_AWA_EDGES.clear()
+
+    # Keep edges after program exit so user can `ardb-dump`
+    if not keep_edges:
+        _EDGES.clear()
 
     # addresses change across runs => invalidate whitelist addr-map
     _invalidate_whitelist_addrs()
 
+
 def _on_exited(event):
-    _cleanup_run_scoped("exited")
+    # Program finished: keep edges for `ardb-dump`
+    _cleanup_run_scoped("exited", keep_edges=True)
+
 
 def _on_new_objfile(event):
-    _cleanup_run_scoped("new_objfile")
+    # New load / new run context: drop old edges
+    _cleanup_run_scoped("new_objfile", keep_edges=False)
+
 
 # -------------------------
 # Breakpoints
@@ -415,10 +502,17 @@ class PollEntryBP(gdb.Breakpoint):
             if awa is not None:
                 awa_ty, _awa_val = awa
 
-                if self.internal and not PRINT_INTERNAL_POLL_HITS:
-                    gdb.write(f"[ARD]   awaitee@{fn}: {awa_ty}\n")
-                else:
-                    gdb.write(f"[ARD]   awaitee: {awa_ty}\n")
+                # Dedup awaitee edges (tree edges, not poll events)
+                key = (fn, awa_ty)
+                if key not in _SEEN_AWA_EDGES:
+                    _SEEN_AWA_EDGES.add(key)
+                    _EDGES.append(("awa", fn, awa_ty))
+                    if self.internal and not PRINT_INTERNAL_POLL_HITS:
+                        gdb.write(f"[ARD]   awaitee@{fn}: {awa_ty}\n")
+                    else:
+                        gdb.write(f"[ARD]   awaitee: {awa_ty}\n")
+
+
 
                 child_poll = _child_poll_symbol_from_awaitee_type(awa_ty)
                 if child_poll and (child_poll not in _ACTIVE_ROOTS):
@@ -471,7 +565,9 @@ class CallSiteBP(gdb.Breakpoint):
         edge = (caller, callee)
         if edge not in _SEEN_CALL_EDGES:
             _SEEN_CALL_EDGES.add(edge)
+            _EDGES.append(("call", caller, callee))
             gdb.write(f"[ARD]   call@{caller} -> {callee}\n")
+
 
         return False
 
@@ -523,6 +619,8 @@ class ARDResetCommand(gdb.Command):
         _CALLSITE_INSTALLED_FOR_FN.clear()
         _ACTIVE_ROOTS.clear()
         _SEEN_CALL_EDGES.clear()
+        _SEEN_AWA_EDGES.clear()
+        _EDGES.clear()
 
         _invalidate_whitelist_addrs()
         gdb.write("[ARD] reset done.\n")
@@ -573,6 +671,78 @@ class ARDGenWhitelistCommand(gdb.Command):
         except Exception as e:
             gdb.write(f"[ARD] gen_default_whitelist failed: {e}\n")
 
+class ARDDumpCommand(gdb.Command):
+    """
+    ardb-dump [path]
+      Dump collected edges (call + awaitee).
+      If path omitted: print to GDB console.
+    """
+    def __init__(self):
+        super().__init__("ardb-dump", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        path = arg.strip()
+
+        lines = []
+        lines.append("# kind src -> dst")
+        for kind, src, dst in _EDGES:
+            lines.append(f"{kind} {src} -> {dst}")
+
+        out = "\n".join(lines) + "\n"
+
+        if not path:
+            gdb.write(out)
+            return
+
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            with open(path, "w", encoding="utf-8") as fp:
+                fp.write(out)
+            gdb.write(f"[ARD] dumped {len(_EDGES)} edges -> {path}\n")
+        except Exception as e:
+            gdb.write(f"[ARD] dump failed: {e}\n")
+
+class ARDTreeCommand(gdb.Command):
+    """
+    ardb-tree <root> [path]
+      Print a normalized tree from collected edges.
+      - root: e.g. minimal::nonleaf::{async_fn#0}
+      - path: optional file path to write
+    """
+    def __init__(self):
+        super().__init__("ardb-tree", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        argv = shlex.split(arg)
+        if not argv:
+            gdb.write("Usage: ardb-tree <root> [path]\n")
+            return
+
+        root = argv[0]
+        path = argv[1] if len(argv) >= 2 else ""
+
+        out = _render_tree(root)
+
+        if not path:
+            gdb.write(out)
+            return
+
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            with open(path, "w", encoding="utf-8") as fp:
+                fp.write(out)
+            gdb.write(f"[ARD] tree written -> {path}\n")
+        except Exception as e:
+            gdb.write(f"[ARD] tree write failed: {e}\n")
+
 # -------------------------
 # Entry
 # -------------------------
@@ -586,6 +756,8 @@ def install():
     ARDResetCommand()
     ARDLoadWhitelistCommand()
     ARDGenWhitelistCommand()
+    ARDDumpCommand()
+    ARDTreeCommand()
 
     if not _EVENTS_INSTALLED:
         try:
@@ -598,4 +770,4 @@ def install():
             pass
         _EVENTS_INSTALLED = True
 
-    gdb.write("[ARD] installed. Commands: ardb-trace, ardb-reset, ardb-load-whitelist, ardb-gen-whitelist\n")
+    gdb.write("[ARD] installed. Commands: ardb-trace, ardb-reset, ardb-load-whitelist, ardb-gen-whitelist, ardb-dump, ardb-tree\n")
