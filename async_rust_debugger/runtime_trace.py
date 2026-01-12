@@ -19,6 +19,67 @@ TREE_MAX_DEPTH = 50
 TREE_SHOW_SHARED = True          # False => not displaying `(shared)` edges (dangerous)
 TREE_MARK_SHARED_LEAVES = False  # False => not marking `(shared)` for leaf nodes
 
+# -------------------------
+# Coroutine instance tracking (runtime)
+# -------------------------
+
+_CO_NEXT_ID = 1
+_CO_BY_KEY = {}      # (poll_sym, this_ptr) -> coro_id
+_CO_META = {}        # coro_id -> (poll_sym, this_ptr)
+_TLS_STACK = {}      # thread_num -> [coro_id, ...]
+
+def _thread_id() -> int:
+    t = gdb.selected_thread()
+    return t.num if t is not None else 0
+
+def _get_or_make_coro_id(poll_sym: str, this_ptr: int) -> int:
+    global _CO_NEXT_ID
+    key = (poll_sym, int(this_ptr))
+    cid = _CO_BY_KEY.get(key)
+    if cid is None:
+        cid = _CO_NEXT_ID
+        _CO_NEXT_ID += 1
+        _CO_BY_KEY[key] = cid
+        _CO_META[cid] = key
+        gdb.write(f"[ARD] coro#{cid} new: {poll_sym} @ {this_ptr:#x}\n")
+    return cid
+
+def _push_coro(cid: int) -> int:
+    tid = _thread_id()
+    st = _TLS_STACK.setdefault(tid, [])
+    st.append(cid)
+    return len(st) - 1  # depth
+
+def _current_coro():
+    tid = _thread_id()
+    st = _TLS_STACK.get(tid, [])
+    return (st[-1], len(st) - 1) if st else (0, -1)
+
+class _PopOnReturnBP(gdb.FinishBreakpoint):
+    """Pop coroutine stack when current function returns."""
+    def __init__(self, tid: int, cid: int):
+        super().__init__(gdb.selected_frame(), internal=True)
+        self.silent = True
+        self.tid = tid
+        self.cid = cid
+        # finish bp is address-context sensitive -> run-scoped
+        _RUN_SCOPED_BPS.append(self)
+
+    def stop(self):
+        st = _TLS_STACK.get(self.tid, [])
+        if not st:
+            return False
+
+        if st[-1] == self.cid:
+            st.pop()
+            return False
+
+        # fallback: remove from back if mismatch
+        for i in range(len(st) - 1, -1, -1):
+            if st[i] == self.cid:
+                del st[i]
+                break
+        return False
 
 # -------------------------
 # State
@@ -29,7 +90,7 @@ _RUN_SCOPED_BPS = []
 
 _CALLSITE_INSTALLED_FOR_FN = set()   # per-run
 _SEEN_CALL_EDGES = set()             # per-run (caller, callee)
-_SEEN_AWA_EDGES = set()              # per-run (src_fn, awa_ty)
+_SEEN_AWA_EDGES = set()  # (cid, src_fn, awa_ty)
 
 _ACTIVE_ROOTS = set()                # symbol roots/children installed (symbol BPs)
 
@@ -447,11 +508,30 @@ def _cleanup_run_scoped(*, keep_edges: bool):
 
     _invalidate_whitelist_addrs()
 
+    _TLS_STACK.clear()
+    _CO_BY_KEY.clear()
+    _CO_META.clear()
+    global _CO_NEXT_ID
+    _CO_NEXT_ID = 1
+
+
 def _on_exited(event):
     _cleanup_run_scoped(keep_edges=True)
+    _TLS_STACK.clear()
+    _CO_BY_KEY.clear()
+    _CO_META.clear()
+    global _CO_NEXT_ID
+    _CO_NEXT_ID = 1
+
 
 def _on_new_objfile(event):
     _cleanup_run_scoped(keep_edges=False)
+    _TLS_STACK.clear()
+    _CO_BY_KEY.clear()
+    _CO_META.clear()
+    global _CO_NEXT_ID
+    _CO_NEXT_ID = 1
+
 
 # -------------------------
 # Breakpoints
@@ -471,24 +551,41 @@ class PollEntryBP(gdb.Breakpoint):
     def stop(self) -> bool:
         fn = _current_function_name()
 
+        # ---- coro context enter (best-effort) ----
+        tid = _thread_id()
+        this_ptr = 0
+        try:
+            this_ptr = _reg_u64("rdi")   # x86_64 SysV: first arg
+        except Exception:
+            this_ptr = 0
+
+        poll_sym = self.poll_sym or fn
+        cid = 0
+        depth = -1
+        if poll_sym and this_ptr:
+            cid = _get_or_make_coro_id(poll_sym, this_ptr)
+            depth = _push_coro(cid)
+            _PopOnReturnBP(tid, cid)
+
+        indent = "  " * max(depth, 0)
+
+
         _build_whitelist_addr_map_if_needed(caller_is_user_visible=(not self.internal))
 
         if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
-            gdb.write(f"[ARD] poll: {fn}\n")
+            gdb.write(f"[ARD]{indent} poll[coro#{cid}] {fn}\n")
 
         if self.poll_sym:
             awa = _try_read_awaitee_from_current_poll(self.poll_sym)
             if awa is not None:
                 awa_ty, _awa_val = awa
-                key = (fn, awa_ty)
+                key = (cid, fn, awa_ty)   # 关键：按协程实例去重
                 if key not in _SEEN_AWA_EDGES:
                     _SEEN_AWA_EDGES.add(key)
-                    _EDGES.append(("awa", fn, awa_ty))
 
-                    if self.internal and not PRINT_INTERNAL_POLL_HITS:
-                        gdb.write(f"[ARD]   awaitee@{fn}: {awa_ty}\n")
-                    else:
-                        gdb.write(f"[ARD]   awaitee: {awa_ty}\n")
+                    # 实时输出也带 coro#，和 call 对齐
+                    gdb.write(f"[ARD]{indent} awa[coro#{cid}] {fn} -> {awa_ty}\n")
+
 
                 child_poll = _child_poll_symbol_from_awaitee_type(awa_ty)
                 if child_poll and (child_poll not in _ACTIVE_ROOTS):
@@ -533,11 +630,16 @@ class CallSiteBP(gdb.Breakpoint):
         PollEntryBP(f"*{target:#x}", poll_sym=callee, internal=True, temporary=True)
 
         caller = _current_function_name()
-        edge = (caller, callee)
+        cid, depth = _current_coro()
+        indent = "  " * max(depth, 0)
+
+        edge = (cid, caller, callee)   # critical: deduplicate according to coroutine instance
         if edge not in _SEEN_CALL_EDGES:
             _SEEN_CALL_EDGES.add(edge)
-            _EDGES.append(("call", caller, callee))
-            gdb.write(f"[ARD]   call@{caller} -> {callee}\n")
+            gdb.write(f"[ARD]{indent} call[coro#{cid}] {caller} -> {callee}\n")
+
+
+
 
         return False
 
@@ -589,6 +691,13 @@ class ARDResetCommand(gdb.Command):
         _EDGES.clear()
 
         _invalidate_whitelist_addrs()
+        
+        _TLS_STACK.clear()
+        _CO_BY_KEY.clear()
+        _CO_META.clear()
+        global _CO_NEXT_ID
+        _CO_NEXT_ID = 1
+
         gdb.write("[ARD] reset done.\n")
 
 class ARDLoadWhitelistCommand(gdb.Command):
@@ -628,65 +737,6 @@ class ARDGenWhitelistCommand(gdb.Command):
         except Exception as e:
             gdb.write(f"[ARD] gen_default_whitelist failed: {e}\n")
 
-class ARDDumpCommand(gdb.Command):
-    def __init__(self):
-        super().__init__("ardb-dump", gdb.COMMAND_USER)
-
-    def invoke(self, arg, from_tty):
-        path = arg.strip()
-
-        lines = ["# kind src -> dst"]
-        for kind, src, dst in _EDGES:
-            lines.append(f"{kind} {src} -> {dst}")
-        out = "\n".join(lines) + "\n"
-
-        if not path:
-            gdb.write(out)
-            return
-
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-        except Exception:
-            pass
-
-        try:
-            with open(path, "w", encoding="utf-8") as fp:
-                fp.write(out)
-            gdb.write(f"[ARD] dumped {len(_EDGES)} edges -> {path}\n")
-        except Exception as e:
-            gdb.write(f"[ARD] dump failed: {e}\n")
-
-class ARDTreeCommand(gdb.Command):
-    def __init__(self):
-        super().__init__("ardb-tree", gdb.COMMAND_USER)
-
-    def invoke(self, arg, from_tty):
-        argv = shlex.split(arg)
-        if not argv:
-            gdb.write("Usage: ardb-tree <root> [path]\n")
-            return
-
-        root = argv[0]
-        path = argv[1] if len(argv) >= 2 else ""
-
-        out = _render_tree(root)
-
-        if not path:
-            gdb.write(out)
-            return
-
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-        except Exception:
-            pass
-
-        try:
-            with open(path, "w", encoding="utf-8") as fp:
-                fp.write(out)
-            gdb.write(f"[ARD] tree written -> {path}\n")
-        except Exception as e:
-            gdb.write(f"[ARD] tree write failed: {e}\n")
-
 # -------------------------
 # Entry
 # -------------------------
@@ -701,8 +751,6 @@ def install():
     ARDResetCommand()
     ARDLoadWhitelistCommand()
     ARDGenWhitelistCommand()
-    ARDDumpCommand()
-    ARDTreeCommand()
 
     if not _EVENTS_INSTALLED:
         try:
@@ -717,5 +765,5 @@ def install():
 
     gdb.write(
         "[ARD] installed. Commands: ardb-trace, ardb-reset, ardb-load-whitelist, "
-        "ardb-gen-whitelist, ardb-dump, ardb-tree\n"
+        "ardb-gen-whitelist \n"
     )
