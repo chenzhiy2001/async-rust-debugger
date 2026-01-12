@@ -9,7 +9,7 @@ import gdb
 
 MAX_CALLSITES_PER_FN = 200
 
-# True => 你能看到所有内部 future / poll 的实时输出（更完整，但更吵）
+# True => 打印所有内部 future / poll 的实时输出（更完整，但更吵）
 PRINT_INTERNAL_POLL_HITS = True
 
 # True => 第一次进入用户可见 poll 时，打印 whitelist 地址解析统计
@@ -98,10 +98,13 @@ _RUN_SCOPED_BPS = []
 _CALLSITE_INSTALLED_FOR_FN = set()   # per-run: avoid re-installing callsite BPs
 _ACTIVE_ROOTS = set()                # poll symbols we installed PollEntryBP for
 
-_WHITELIST = None                    # set[str] | None
+# whitelist: exact + prefix(*)
+_WHITELIST_EXACT = None   # set[str] | None
+_WHITELIST_PREFIX = None  # list[str] | None
 _WHITELIST_PATH = None
 
-_WHITELIST_ADDR_MAP = {}             # per-run: addr -> canonical whitelist symbol
+# addr map only for exact symbols (PIE/ASLR-safe per-run)
+_WHITELIST_ADDR_MAP = {}             # addr -> exact symbol
 _WHITELIST_ADDR_READY = False
 
 _EVENTS_INSTALLED = False
@@ -218,7 +221,15 @@ def _resolve_call_target_from_asm(asm: str) -> int | None:
         slot = _reg_u64(base) + disp
         return _read_ptr(slot)
 
-    # NOTE: 没处理 *disp(%rip)（PLT/GOT 之类）；如果你后面需要我也可以补上
+    # call *disp(%rip)  (x86_64: ff 15 disp32 ; instruction length is 6 bytes)
+    m = re.search(r"call\w*\s+\*([\-0-9a-fx]+)\(\%rip\)", s)
+    if m:
+        disp_s = m.group(1)
+        disp = int(disp_s, 16) if disp_s.startswith(("0x", "-0x")) else int(disp_s, 10)
+        pc = _current_pc()
+        slot = pc + 6 + disp  # RIP-relative base = next instruction
+        return _read_ptr(slot)
+
     return None
 
 
@@ -291,19 +302,30 @@ def _default_whitelist_path() -> str | None:
         return None
     return os.path.join(temp_dir, "poll_functions.txt")
 
-def _load_whitelist_file(path: str) -> set[str]:
-    syms: set[str] = set()
+def _load_whitelist_file(path: str):
+    """
+    Supports:
+      - exact:  minimal::sync_a
+      - prefix: minimal::block_on*   (matches any symbol starting with that prefix)
+    Also supports existing "idx sym" format.
+    Returns: (exact_set, prefix_list)
+    """
+    exact: set[str] = set()
+    prefix: list[str] = []
     with open(path, "r", encoding="utf-8") as fp:
         for raw in fp:
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
             parts = line.split()
-            if len(parts) >= 2 and parts[0].isdigit():
-                syms.add(parts[1])
+            sym = parts[1] if (len(parts) >= 2 and parts[0].isdigit()) else line
+
+            if sym.endswith("*"):
+                prefix.append(sym[:-1])
             else:
-                syms.add(line)
-    return syms
+                exact.add(sym)
+
+    return exact, prefix
 
 def _invalidate_whitelist_addrs():
     global _WHITELIST_ADDR_MAP, _WHITELIST_ADDR_READY
@@ -332,16 +354,41 @@ def _try_addr_by_info_address(name: str) -> int | None:
             return int(m.group(1), 16)
     return None
 
+def _whitelist_enabled() -> bool:
+    return (_WHITELIST_EXACT is not None) or (_WHITELIST_PREFIX is not None)
+
+def _normalize_sym_name(sym: str) -> str:
+    # strip PLT suffix if present
+    if sym.endswith("@plt"):
+        return sym[:-4]
+    return sym
+
+def _whitelist_allows_by_name(sym: str) -> str | None:
+    if not _whitelist_enabled():
+        return sym  # no whitelist => allow
+
+    if _WHITELIST_EXACT is not None and sym in _WHITELIST_EXACT:
+        return sym
+
+    if _WHITELIST_PREFIX:
+        for p in _WHITELIST_PREFIX:
+            if sym.startswith(p):
+                return sym
+
+    return None
+
 def _build_whitelist_addr_map_if_needed(caller_is_user_visible: bool):
     global _WHITELIST_ADDR_READY, _WHITELIST_ADDR_MAP
-    if _WHITELIST is None or _WHITELIST_ADDR_READY:
+
+    # addr-map only for exact symbols
+    if _WHITELIST_EXACT is None or _WHITELIST_ADDR_READY:
         return
 
     resolved = 0
-    total = len(_WHITELIST)
+    total = len(_WHITELIST_EXACT)
     addr_map = {}
 
-    for name in _WHITELIST:
+    for name in _WHITELIST_EXACT:
         addr = _try_addr_by_lookup_global_symbol(name)
         if addr is None:
             addr = _try_addr_by_info_address(name)
@@ -354,10 +401,11 @@ def _build_whitelist_addr_map_if_needed(caller_is_user_visible: bool):
     _WHITELIST_ADDR_READY = True
 
     if caller_is_user_visible and PRINT_WHITELIST_ADDR_STATS:
-        gdb.write(f"[ARD] whitelist addrs: {resolved}/{total} resolved (PIE/ASLR-safe)\n")
+        prefix_n = len(_WHITELIST_PREFIX) if _WHITELIST_PREFIX else 0
+        gdb.write(f"[ARD] whitelist addrs: {resolved}/{total} resolved (exact), prefix={prefix_n}\n")
 
 def _whitelist_allows_by_addr(target_addr: int) -> str | None:
-    if _WHITELIST is None or not _WHITELIST_ADDR_READY:
+    if _WHITELIST_EXACT is None or not _WHITELIST_ADDR_READY:
         return None
     return _WHITELIST_ADDR_MAP.get(int(target_addr))
 
@@ -377,29 +425,39 @@ def _callee_candidates(addr: int) -> list[str]:
     n2 = _info_symbol_name(addr)
     if n2:
         cands.append(n2.strip())
+
     seen = set()
     out = []
     for s in cands:
-        if s and s not in seen:
-            out.append(s)
-            seen.add(s)
+        s2 = s.strip()
+        if s2 and s2 not in seen:
+            out.append(s2)
+            seen.add(s2)
     return out
 
 def _pick_interesting_callee(target_addr: int) -> str | None:
-    # If whitelist loaded and addr-map ready: strict by address
-    if _WHITELIST is not None and _WHITELIST_ADDR_READY:
-        return _whitelist_allows_by_addr(target_addr)
-
-    # addr-map not ready yet: try name membership
-    cands = _callee_candidates(target_addr)
-    if _WHITELIST is not None:
-        for n in cands:
-            if n in _WHITELIST:
-                return n
+    # whitelist enabled + addr-map ready: prefer addr hit, else fallback to name
+    if _whitelist_enabled() and _WHITELIST_ADDR_READY:
+        hit = _whitelist_allows_by_addr(target_addr)
+        if hit:
+            return hit
+        # address miss: fallback to name-based match (prefix/plt/monomorph)
+        for n in _callee_candidates(target_addr):
+            n2 = _normalize_sym_name(n)
+            if _whitelist_allows_by_name(n2):
+                return n2
         return None
 
-    # no whitelist: heuristic
-    for n in cands:
+    # whitelist enabled but addr-map not ready: name-based match
+    if _whitelist_enabled():
+        for n in _callee_candidates(target_addr):
+            n2 = _normalize_sym_name(n)
+            if _whitelist_allows_by_name(n2):
+                return n2
+        return None
+
+    # no whitelist: heuristic (only poll-ish)
+    for n in _callee_candidates(target_addr):
         if _is_pollish_name(n):
             return n
     return None
@@ -480,7 +538,7 @@ class PollEntryBP(gdb.Breakpoint):
 
         _build_whitelist_addr_map_if_needed(caller_is_user_visible=(not self.internal))
 
-        # new coro line (aligned)
+        # new coro line
         if cid and is_new:
             gdb.write(f"[ARD]{indent} coro#{cid} new: {poll_sym} @ {this_ptr:#x}\n")
 
@@ -498,7 +556,8 @@ class PollEntryBP(gdb.Breakpoint):
                 # auto-trace child async fn/block by symbol (install once)
                 child_poll = _child_poll_symbol_from_awaitee_type(awa_ty)
                 if child_poll and (child_poll not in _ACTIVE_ROOTS):
-                    if _WHITELIST is None or child_poll in _WHITELIST:
+                    # whitelist enabled => only install if allowed
+                    if (not _whitelist_enabled()) or _whitelist_allows_by_name(child_poll):
                         _ACTIVE_ROOTS.add(child_poll)
                         PollEntryBP(child_poll, poll_sym=child_poll, internal=True, temporary=False)
 
@@ -552,7 +611,6 @@ class CallSiteBP(gdb.Breakpoint):
             _ACTIVE_ROOTS.add(callee)
             PollEntryBP(callee, poll_sym=callee, internal=True, temporary=False)
 
-
         return False
 
 
@@ -577,7 +635,7 @@ class ARDTraceCommand(gdb.Command):
             gdb.write(f"[ARD] root already traced: {sym}\n")
             return
 
-        if _WHITELIST is not None and sym not in _WHITELIST:
+        if _whitelist_enabled() and (not _whitelist_allows_by_name(sym)):
             gdb.write(f"[ARD] warning: root not in whitelist: {sym}\n")
 
         _ACTIVE_ROOTS.add(sym)
@@ -618,22 +676,24 @@ class ARDLoadWhitelistCommand(gdb.Command):
         super().__init__("ardb-load-whitelist", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
-        global _WHITELIST, _WHITELIST_PATH
+        global _WHITELIST_EXACT, _WHITELIST_PREFIX, _WHITELIST_PATH
         path = arg.strip() or _default_whitelist_path()
         if not path:
             gdb.write("[ARD] whitelist path not provided and ASYNC_RUST_DEBUGGER_TEMP_DIR is not set.\n")
             return
 
         try:
-            wl = _load_whitelist_file(path)
+            wl_exact, wl_prefix = _load_whitelist_file(path)
         except Exception as e:
             gdb.write(f"[ARD] failed to load whitelist: {e}\n")
             return
 
-        _WHITELIST = wl
+        _WHITELIST_EXACT = wl_exact
+        _WHITELIST_PREFIX = wl_prefix
         _WHITELIST_PATH = path
         _invalidate_whitelist_addrs()
-        gdb.write(f"[ARD] whitelist loaded: {len(wl)} symbols from {path}\n")
+
+        gdb.write(f"[ARD] whitelist loaded: exact={len(wl_exact)} prefix={len(wl_prefix)} from {path}\n")
 
 
 class ARDGenWhitelistCommand(gdb.Command):
