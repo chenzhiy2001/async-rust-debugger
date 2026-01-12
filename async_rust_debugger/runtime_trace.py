@@ -8,23 +8,37 @@ import gdb
 # -------------------------
 
 MAX_CALLSITES_PER_FN = 200
+
+# True => 你能看到所有内部 future / poll 的实时输出（更完整，但更吵）
 PRINT_INTERNAL_POLL_HITS = True
+
+# True => 第一次进入用户可见 poll 时，打印 whitelist 地址解析统计
 PRINT_WHITELIST_ADDR_STATS = True
+
 
 # -------------------------
 # Coroutine instance tracking (runtime)
 # -------------------------
+# 目标：
+# - 每个 (poll_symbol, env_ptr) 视作一个“协程实例”
+# - 每次 poll 打印 poll#seq（第几轮 poll）
+# - 实时打印 call / awa（不做输出去重）
+# - 通过栈维护缩进，让父子 future 关系可读
 
 _CO_NEXT_ID = 1
-_CO_BY_KEY = {}      # (poll_sym, this_ptr) -> coro_id
-_CO_META = {}        # coro_id -> (poll_sym, this_ptr)
-_TLS_STACK = {}      # thread_num -> [coro_id, ...]
+_CO_BY_KEY = {}        # (poll_sym, this_ptr) -> coro_id
+_CO_META = {}          # coro_id -> (poll_sym, this_ptr)
+_CO_POLL_SEQ = {}      # coro_id -> poll_count
+_TLS_STACK = {}        # thread_num -> [coro_id, ...]
 
 def _thread_id() -> int:
     t = gdb.selected_thread()
     return t.num if t is not None else 0
 
-def _get_or_make_coro_id(poll_sym: str, this_ptr: int) -> int:
+def _get_or_make_coro_id(poll_sym: str, this_ptr: int):
+    """
+    Returns: (cid, is_new)
+    """
     global _CO_NEXT_ID
     key = (poll_sym, int(this_ptr))
     cid = _CO_BY_KEY.get(key)
@@ -33,8 +47,9 @@ def _get_or_make_coro_id(poll_sym: str, this_ptr: int) -> int:
         _CO_NEXT_ID += 1
         _CO_BY_KEY[key] = cid
         _CO_META[cid] = key
-        gdb.write(f"[ARD] coro#{cid} new: {poll_sym} @ {this_ptr:#x}\n")
-    return cid
+        _CO_POLL_SEQ[cid] = 0
+        return cid, True
+    return cid, False
 
 def _push_coro(cid: int) -> int:
     tid = _thread_id()
@@ -72,15 +87,16 @@ class _PopOnReturnBP(gdb.FinishBreakpoint):
                 break
         return False
 
+
 # -------------------------
-# State
+# State (breakpoints / whitelist)
 # -------------------------
 
 _CREATED_BPS = []
 _RUN_SCOPED_BPS = []
 
 _CALLSITE_INSTALLED_FOR_FN = set()   # per-run: avoid re-installing callsite BPs
-_ACTIVE_ROOTS = set()                # symbol roots/children installed (symbol BPs)
+_ACTIVE_ROOTS = set()                # poll symbols we installed PollEntryBP for
 
 _WHITELIST = None                    # set[str] | None
 _WHITELIST_PATH = None
@@ -89,6 +105,7 @@ _WHITELIST_ADDR_MAP = {}             # per-run: addr -> canonical whitelist symb
 _WHITELIST_ADDR_READY = False
 
 _EVENTS_INSTALLED = False
+
 
 # -------------------------
 # Low-level helpers
@@ -182,7 +199,7 @@ def _current_asm() -> str:
 def _resolve_call_target_from_asm(asm: str) -> int | None:
     s = asm.strip()
 
-    # direct call
+    # direct call (has immediate 0xADDR)
     if "call" in s and "0x" in s and "*0x" not in s:
         m = HEX_ADDR_RE.search(s)
         if m:
@@ -201,8 +218,9 @@ def _resolve_call_target_from_asm(asm: str) -> int | None:
         slot = _reg_u64(base) + disp
         return _read_ptr(slot)
 
-    # NOTE: 没处理 *disp(%rip)
+    # NOTE: 没处理 *disp(%rip)（PLT/GOT 之类）；如果你后面需要我也可以补上
     return None
+
 
 # -------------------------
 # __awaitee extraction (best-effort)
@@ -224,7 +242,12 @@ def _try_read_awaitee_from_current_poll(poll_sym: str):
     except gdb.error:
         return None
 
-    env_ptr = _reg_u64("rdi")
+    # x86_64 SysV: rdi = env ptr
+    try:
+        env_ptr = _reg_u64("rdi")
+    except Exception:
+        return None
+
     if env_ptr == 0:
         return None
 
@@ -256,6 +279,7 @@ def _child_poll_symbol_from_awaitee_type(awa_ty: str) -> str | None:
     if "{async_block_env#" in awa_ty:
         return awa_ty.replace("{async_block_env#", "{async_block#")
     return None
+
 
 # -------------------------
 # Whitelist (PIE/ASLR-safe via per-run addr map)
@@ -337,6 +361,7 @@ def _whitelist_allows_by_addr(target_addr: int) -> str | None:
         return None
     return _WHITELIST_ADDR_MAP.get(int(target_addr))
 
+
 # -------------------------
 # Callee selection
 # -------------------------
@@ -379,6 +404,7 @@ def _pick_interesting_callee(target_addr: int) -> str | None:
             return n
     return None
 
+
 # -------------------------
 # Run-scoped cleanup (PIE/ASLR safe)
 # -------------------------
@@ -397,6 +423,7 @@ def _cleanup_run_scoped():
     _TLS_STACK.clear()
     _CO_BY_KEY.clear()
     _CO_META.clear()
+    _CO_POLL_SEQ.clear()
     global _CO_NEXT_ID
     _CO_NEXT_ID = 1
 
@@ -405,6 +432,7 @@ def _on_exited(event):
 
 def _on_new_objfile(event):
     _cleanup_run_scoped()
+
 
 # -------------------------
 # Breakpoints
@@ -418,6 +446,7 @@ class PollEntryBP(gdb.Breakpoint):
         self.internal = internal
         _CREATED_BPS.append(self)
 
+        # addr breakpoints / finish breakpoints are run-scoped
         if isinstance(location, str) and location.strip().startswith("*"):
             _RUN_SCOPED_BPS.append(self)
 
@@ -427,33 +456,46 @@ class PollEntryBP(gdb.Breakpoint):
         # ---- coro context enter (best-effort) ----
         tid = _thread_id()
         try:
-            this_ptr = _reg_u64("rdi")   # x86_64 SysV: first arg
+            this_ptr = _reg_u64("rdi")   # x86_64 SysV: first arg (env ptr)
         except Exception:
             this_ptr = 0
 
         poll_sym = self.poll_sym or fn
         cid = 0
+        is_new = False
         depth = -1
+
         if poll_sym and this_ptr:
-            cid = _get_or_make_coro_id(poll_sym, this_ptr)
+            cid, is_new = _get_or_make_coro_id(poll_sym, this_ptr)
             depth = _push_coro(cid)
             _PopOnReturnBP(tid, cid)
 
         indent = "  " * max(depth, 0)
 
+        # poll sequence per coro instance
+        seq = 0
+        if cid:
+            seq = _CO_POLL_SEQ.get(cid, 0) + 1
+            _CO_POLL_SEQ[cid] = seq
+
         _build_whitelist_addr_map_if_needed(caller_is_user_visible=(not self.internal))
+
+        # new coro line (aligned)
+        if cid and is_new:
+            gdb.write(f"[ARD]{indent} coro#{cid} new: {poll_sym} @ {this_ptr:#x}\n")
 
         # poll line
         if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
-            gdb.write(f"[ARD]{indent} poll[coro#{cid}] {fn}\n")
+            gdb.write(f"[ARD]{indent} poll[coro#{cid} poll#{seq}] {fn}\n")
 
-        # awaitee line (no dedup)
+        # awaitee line (no output dedup)
         if self.poll_sym:
             awa = _try_read_awaitee_from_current_poll(self.poll_sym)
             if awa is not None:
                 awa_ty, _awa_val = awa
-                gdb.write(f"[ARD]{indent} awa[coro#{cid}] {fn} -> {awa_ty}\n")
+                gdb.write(f"[ARD]{indent} awa[coro#{cid} poll#{seq}] {fn} -> {awa_ty}\n")
 
+                # auto-trace child async fn/block by symbol (install once)
                 child_poll = _child_poll_symbol_from_awaitee_type(awa_ty)
                 if child_poll and (child_poll not in _ACTIVE_ROOTS):
                     if _WHITELIST is None or child_poll in _WHITELIST:
@@ -466,7 +508,7 @@ class PollEntryBP(gdb.Breakpoint):
                 call_sites = _collect_call_sites()
             except gdb.error as e:
                 if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
-                    gdb.write(f"[ARD]   call-site scan failed: {e}\n")
+                    gdb.write(f"[ARD]{indent} call-site scan failed: {e}\n")
                 return False
 
             for a in call_sites:
@@ -474,9 +516,10 @@ class PollEntryBP(gdb.Breakpoint):
 
             _CALLSITE_INSTALLED_FOR_FN.add(fn)
             if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
-                gdb.write(f"[ARD]   call-sites: {len(call_sites)}\n")
+                gdb.write(f"[ARD]{indent} call-sites: {len(call_sites)}\n")
 
         return False
+
 
 class CallSiteBP(gdb.Breakpoint):
     def __init__(self, addr: int):
@@ -498,16 +541,17 @@ class CallSiteBP(gdb.Breakpoint):
         caller = _current_function_name()
         cid, depth = _current_coro()
         indent = "  " * max(depth, 0)
+        seq = _CO_POLL_SEQ.get(cid, 0) if cid else 0
 
-        # call line (no dedup)
-        gdb.write(f"[ARD]{indent} call[coro#{cid}] {caller} -> {callee}\n")
+        # call line (no output dedup)
+        gdb.write(f"[ARD]{indent} call[coro#{cid} poll#{seq}] {caller} -> {callee}\n")
 
-        # IMPORTANT: 不要再装 *addr 的临时 PollEntryBP，避免和已有 symbol BP 双重命中
-        # 改成：若还没追踪过该 poll symbol，就按“符号名”装一个（只装一次）
-        if callee not in _ACTIVE_ROOTS:
-            # whitelist 模式下仍然只会进到这里（callee 已经通过 _pick_interesting_callee 过滤）
+        # IMPORTANT: 不要装 *addr 的临时 PollEntryBP（会导致重复命中）
+        # 只按“符号名”装一个（一次装好，所有实例都会进）
+        if _is_pollish_name(callee) and callee not in _ACTIVE_ROOTS:
             _ACTIVE_ROOTS.add(callee)
             PollEntryBP(callee, poll_sym=callee, internal=True, temporary=False)
+
 
         return False
 
@@ -540,6 +584,7 @@ class ARDTraceCommand(gdb.Command):
         PollEntryBP(sym, poll_sym=sym, internal=False, temporary=False)
         gdb.write(f"[ARD] trace root: {sym}\n")
 
+
 class ARDResetCommand(gdb.Command):
     def __init__(self):
         super().__init__("ardb-reset", gdb.COMMAND_USER)
@@ -561,10 +606,12 @@ class ARDResetCommand(gdb.Command):
         _TLS_STACK.clear()
         _CO_BY_KEY.clear()
         _CO_META.clear()
+        _CO_POLL_SEQ.clear()
         global _CO_NEXT_ID
         _CO_NEXT_ID = 1
 
         gdb.write("[ARD] reset done.\n")
+
 
 class ARDLoadWhitelistCommand(gdb.Command):
     def __init__(self):
@@ -588,6 +635,7 @@ class ARDLoadWhitelistCommand(gdb.Command):
         _invalidate_whitelist_addrs()
         gdb.write(f"[ARD] whitelist loaded: {len(wl)} symbols from {path}\n")
 
+
 class ARDGenWhitelistCommand(gdb.Command):
     def __init__(self):
         super().__init__("ardb-gen-whitelist", gdb.COMMAND_USER)
@@ -602,6 +650,7 @@ class ARDGenWhitelistCommand(gdb.Command):
             gen_default_whitelist()
         except Exception as e:
             gdb.write(f"[ARD] gen_default_whitelist failed: {e}\n")
+
 
 # -------------------------
 # Entry
