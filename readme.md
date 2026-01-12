@@ -4,17 +4,16 @@
 
 ```sh
 make env
+# to avoid recompiling you can use just-debug
+make debug TESTCASE=minimal
+(gdb) ardb-gen-whitelist
 ```
+in `temp/poll_functions.txt` you can add sync functions or delete functions you don't want to trace.
 
+then in `gdb` run
 ```sh
-# maybe you need to make cmd.sh executable first
-# chmod +x ./cmd.sh
-./cmd.sh compile-tests minimal
-./cmd.sh compile-tests no-external-runtime
-```
-
-```
-log start
-log end
+(gdb) ardb-load-whitelist
+(gdb) ardb-trace the function you want to start tracing from
+(gdb) run
 ```
 

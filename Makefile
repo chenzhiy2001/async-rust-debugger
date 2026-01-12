@@ -3,11 +3,11 @@ SHELL := /bin/bash
 PYTHONPATH := $(PWD)
 ASYNC_RUST_DEBUGGER_TEMP_DIR := $(PWD)/temp
 
-.PHONY: all env check-rust install-rust check-ddbug install-ddbug
+.PHONY: all env check-rust install-rust check-ddbug
 
 all: env
 
-env: check-rust check-ddbug
+env: check-rust
 
 check-rust:
 	@if ! command -v rustc >/dev/null 2>&1; then \
